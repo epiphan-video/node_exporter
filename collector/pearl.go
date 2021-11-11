@@ -15,6 +15,21 @@ import (
 	"github.com/go-kit/log"
 )
 
+var (
+	knownMetrics = []struct {
+		StatusKey      string
+		MetricName     string
+		Description    string
+		NumberOfParams int
+		Multiplier     int
+	}{
+		{"VmRSS", "service_mem_vmrss", "Virtual memory resident set size in bytes", 2, 1024},
+		{"Threads", "service_threads", "Number of threads", 1, 1},
+		{"voluntary_ctxt_switches", "service_voluntary_ctxt_switches", "Number of voluntary context switches", 1, 1},
+		{"nonvoluntary_ctxt_switches", "service_nonvoluntary_ctxt_switches", "Number of nonvoluntary context switches", 1, 1},
+	}
+)
+
 func init() {
 	registerCollector("pearl", defaultEnabled, NewPearlCollector)
 }
@@ -37,9 +52,9 @@ func (c *pearlCollector) Update(ch chan<- prometheus.Metric) error {
 
 	for _, svc := range services {
 		labels := svc.GetLabels()
-		vmRss, err := svc.GetVMRSS()
+		metrics, err := svc.GetStatusFileMetrics()
 		if err != nil {
-			c.logger.Log("msg", "failed to get VMRSS", "service", svc.Name, "err", err)
+			c.logger.Log("msg", "failed to get metrics for service", "service", svc.Name, "err", err)
 			continue
 		}
 
@@ -50,16 +65,20 @@ func (c *pearlCollector) Update(ch chan<- prometheus.Metric) error {
 			labelValues = append(labelValues, v)
 		}
 
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				"service_mem_vmrss",
-				"Virtual memory resident set size in bytes",
-				labelKeys,
-				nil),
-			prometheus.GaugeValue,
-			float64(vmRss),
-			labelValues...,
-		)
+		for _, metric := range knownMetrics {
+			if value, ok := metrics[metric.MetricName]; ok {
+				ch <- prometheus.MustNewConstMetric(
+					prometheus.NewDesc(
+						metric.MetricName,
+						metric.Description,
+						labelKeys,
+						nil),
+					prometheus.GaugeValue,
+					float64(value),
+					labelValues...,
+				)
+			}
+		}
 	}
 
 	return nil
@@ -101,12 +120,13 @@ func (rs *RunitService) getChannelID() string {
 	return strings.TrimSpace(string(buf[:n]))
 }
 
-func (rs *RunitService) GetVMRSS() (int, error) {
+func (rs *RunitService) GetStatusFileMetrics() (map[string]int, error) {
 	status, err := rs.Status()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return getVMRSSFromStatusFile(status.Pid)
+
+	return getMetricsFromStatusFile(status.Pid)
 }
 
 func strippedName(name string) string {
@@ -129,35 +149,38 @@ func (rs *RunitService) GetLabels() map[string]string {
 	return labels
 }
 
-func getVMRSSFromStatusFile(pid int) (int, error) {
+func getMetricsFromStatusFile(pid int) (map[string]int, error) {
 	file := fmt.Sprintf("/proc/%d/status", pid)
 	f, err := os.Open(file)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer f.Close()
 
-	var vmRss int
+	metrics := make(map[string]int)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "VmRSS:") {
-			fields := strings.Fields(line)
-			if len(fields) != 3 {
-				return 0, fmt.Errorf("invalid VmRSS line: %v", fields)
+
+		for _, metric := range knownMetrics {
+			if strings.HasPrefix(line, metric.StatusKey) {
+				parts := strings.Fields(line)
+				if len(parts) != metric.NumberOfParams+1 {
+					return nil, fmt.Errorf("invalid number of params for %s: '%s'", metric.StatusKey, line)
+				}
+
+				value, err := strconv.Atoi(parts[1])
+				if err != nil {
+					return nil, fmt.Errorf("invalid value for %s: '%s'", metric.StatusKey, parts[1])
+				}
+
+				metrics[metric.MetricName] = value * metric.Multiplier
 			}
-			vmRss, err = strconv.Atoi(fields[1])
-			if err != nil {
-				return 0, nil
-			}
-			break
 		}
 	}
-	return vmRss * 1024, nil
-}
 
-func getBasename(path string) string {
-	return filepath.Base(path)
+	return metrics, nil
+
 }
 
 func getServicesInDir(dir string) ([]RunitService, error) {
